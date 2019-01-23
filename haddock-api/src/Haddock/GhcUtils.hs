@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, FlexibleInstances, ViewPatterns #-}
+{-# LANGUAGE BangPatterns, StandaloneDeriving, FlexibleInstances, ViewPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -22,14 +22,23 @@ import Control.Arrow
 import Haddock.Types( DocNameI )
 
 import Exception
+import FastString ( fsLit )
+import FV
 import Outputable
 import Name
 import NameSet
 import Module
+import PrelNames ( mkBaseModule )
 import HscTypes
 import GHC
 import Class
 import DynFlags
+import Var       ( VarBndr(..), TyVarBinder, tyVarKind, updateTyVarKind,
+                   isInvisibleArgFlag )
+import VarSet    ( VarSet, emptyVarSet )
+import VarEnv    ( TyVarEnv, extendVarEnv, elemVarEnv, emptyVarEnv )
+import TyCoRep   ( Type(..), isRuntimeRepVar )
+import TysWiredIn( liftedRepDataConTyCon )
 
 
 moduleString :: Module -> String
@@ -145,6 +154,9 @@ nubByName f ns = go emptyNameSet ns
                             in x : go s' xs
       where
         y = f x
+
+dATA_LIST :: Module
+dATA_LIST = mkBaseModule (fsLit "Data.List")
 
 -- ---------------------------------------------------------------------
 
@@ -421,3 +433,105 @@ setStubDir    f d = d{ stubDir    = Just f
   -- -stubdir D adds an implicit -I D, so that gcc can find the _stub.h file
   -- \#included from the .hc file when compiling with -fvia-C.
 setOutputDir  f = setObjectDir f . setHiDir f . setStubDir f
+
+
+-------------------------------------------------------------------------------
+-- * Free variables of a 'Type'
+-------------------------------------------------------------------------------
+
+-- | Get free type variables in a 'Type' in their order of appearance.
+-- See [Ordering of implicit variables].
+orderedFVs
+  :: VarSet  -- ^ free variables to ignore 
+  -> [Type]  -- ^ types to traverse (in order) looking for free variables
+  -> [TyVar] -- ^ free type variables, in the order they appear in
+orderedFVs vs tys =
+  reverse . fst $ tyCoFVsOfTypes' tys (const True) vs ([], emptyVarSet)
+
+
+-- See the "Free variables of types and coercions" section in 'TyCoRep', or
+-- check out Note [Free variables of types]. The functions in this section
+-- don't output type variables in the order they first appear in in the 'Type'.
+--
+-- For example, 'tyCoVarsOfTypeList' reports an incorrect order for the type
+-- of 'const :: a -> b -> a':
+--
+-- >>> import Name 
+-- >>> import TyCoRep
+-- >>> import TysPrim
+-- >>> import Var
+-- >>> a = TyVarTy alphaTyVar
+-- >>> b = TyVarTy betaTyVar
+-- >>> constTy = mkFunTys [a, b] a
+-- >>> map (getOccString . tyVarName) (tyCoVarsOfTypeList constTy)
+-- ["b","a"]
+--
+-- However, we want to reuse the very optimized traversal machinery there, so
+-- so we make our own `tyCoFVsOfType'`, `tyCoFVsBndr'`, and `tyCoVarsOfTypes'`.
+-- All these do differently is traverse in a different order and ignore
+-- coercion variables.
+
+-- | Just like 'tyCoFVsOfType', but traverses type variables in reverse order
+-- of  appearance.
+tyCoFVsOfType' :: Type -> FV
+tyCoFVsOfType' (TyVarTy v)        a b c = (FV.unitFV v `unionFV` tyCoFVsOfType' (tyVarKind v)) a b c
+tyCoFVsOfType' (TyConApp _ tys)   a b c = tyCoFVsOfTypes' tys a b c
+tyCoFVsOfType' (LitTy {})         a b c = emptyFV a b c
+tyCoFVsOfType' (AppTy fun arg)    a b c = (tyCoFVsOfType' arg `unionFV` tyCoFVsOfType' fun) a b c
+tyCoFVsOfType' (FunTy arg res)    a b c = (tyCoFVsOfType' res `unionFV` tyCoFVsOfType' arg) a b c
+tyCoFVsOfType' (ForAllTy bndr ty) a b c = tyCoFVsBndr' bndr (tyCoFVsOfType' ty)  a b c
+tyCoFVsOfType' (CastTy ty _)      a b c = (tyCoFVsOfType' ty) a b c
+tyCoFVsOfType' (CoercionTy _ )    a b c = emptyFV a b c
+
+-- | Just like 'tyCoFVsOfTypes', but traverses type variables in reverse order
+-- of appearance.
+tyCoFVsOfTypes' :: [Type] -> FV
+tyCoFVsOfTypes' (ty:tys) fv_cand in_scope acc = (tyCoFVsOfTypes' tys `unionFV` tyCoFVsOfType' ty) fv_cand in_scope acc
+tyCoFVsOfTypes' []       fv_cand in_scope acc = emptyFV fv_cand in_scope acc
+
+-- | Just like 'tyCoFVsBndr', but traverses type variables in reverse order of
+-- appearance.
+tyCoFVsBndr' :: TyVarBinder -> FV -> FV
+tyCoFVsBndr' (Bndr tv _) fvs = FV.delFV tv fvs `unionFV` tyCoFVsOfType' (tyVarKind tv)
+
+
+-------------------------------------------------------------------------------
+-- * Defaulting RuntimeRep variables
+-------------------------------------------------------------------------------
+
+-- | Traverses the type, defaulting type variables of kind 'RuntimeRep' to
+-- 'LiftedType'. See 'defaultRuntimeRepVars' in IfaceType.hs the original such
+-- function working over `IfaceType`'s.
+defaultRuntimeRepVars :: Type -> Type
+defaultRuntimeRepVars = go emptyVarEnv
+  where
+    go :: TyVarEnv () -> Type -> Type
+    go subs (ForAllTy (Bndr var flg) ty)
+      | isRuntimeRepVar var
+      , isInvisibleArgFlag flg
+      = let subs' = extendVarEnv subs var ()
+        in go subs' ty
+      | otherwise
+      = ForAllTy (Bndr (updateTyVarKind (go subs) var) flg)
+                 (go subs ty)
+
+    go subs (TyVarTy tv)
+      | tv `elemVarEnv` subs
+      = TyConApp liftedRepDataConTyCon []
+      | otherwise
+      = TyVarTy (updateTyVarKind (go subs) tv)
+
+    go subs (TyConApp tc tc_args)
+      = TyConApp tc (map (go subs) tc_args)
+
+    go subs (FunTy arg res)
+      = FunTy (go subs arg) (go subs res)
+
+    go subs (AppTy t u)
+      = AppTy (go subs t) (go subs u)
+
+    go subs (CastTy x co)
+      = CastTy (go subs x) co
+
+    go _ ty@(LitTy {}) = ty
+    go _ ty@(CoercionTy {}) = ty

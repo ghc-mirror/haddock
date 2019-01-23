@@ -24,26 +24,28 @@ module Haddock.Types (
   module Haddock.Types
   , HsDocString, LHsDocString
   , Fixity(..)
+  , Identifier
   , module Documentation.Haddock.Types
  ) where
 
 import Control.Exception
 import Control.Arrow hiding ((<+>))
 import Control.DeepSeq
-import Control.Monad.IO.Class (MonadIO(..))
 import Data.Typeable
 import Data.Map (Map)
 import Data.Data (Data)
 import qualified Data.Map as Map
+import Documentation.Haddock.Parser
 import Documentation.Haddock.Types
 import BasicTypes (Fixity(..), PromotionFlag(..))
 
 import GHC hiding (NoLink)
-import DynFlags (Language)
+import DynFlags (Language, HasDynFlags(..))
 import qualified GHC.LanguageExtensions as LangExt
 import OccName
 import Outputable
 import Control.Monad (ap)
+import Control.Monad.IO.Class
 
 import Haddock.Backends.Hyperlinker.Types
 
@@ -57,7 +59,6 @@ type InstIfaceMap  = Map Module InstalledInterface  -- TODO: rename
 type DocMap a      = Map Name (MDoc a)
 type ArgMap a      = Map Name (Map Int (MDoc a))
 type SubMap        = Map Name [Name]
-type DeclMap       = Map Name [LHsDecl GhcRn]
 type InstMap       = Map SrcSpan Name
 type FixMap        = Map Name Fixity
 type DocPaths      = (FilePath, Maybe FilePath) -- paths to HTML and sources
@@ -81,9 +82,6 @@ data Interface = Interface
     -- | Is this a signature?
   , ifaceIsSig           :: !Bool
 
-    -- | Original file name of the module.
-  , ifaceOrigFilename    :: !FilePath
-
     -- | Textual information about the module.
   , ifaceInfo            :: !(HaddockModInfo Name)
 
@@ -93,13 +91,8 @@ data Interface = Interface
     -- | Documentation header with cross-reference information.
   , ifaceRnDoc           :: !(Documentation DocName)
 
-    -- | Haddock options for this module (prune, ignore-exports, etc).
+    -- | Haddock options for this module (prune, not-home, etc).
   , ifaceOptions         :: ![DocOption]
-
-    -- | Declarations originating from the module. Excludes declarations without
-    -- names (instances and stand-alone documentation comments). Includes
-    -- names of subordinate declarations mapped to their parent declarations.
-  , ifaceDeclMap         :: !(Map Name [LHsDecl GhcRn])
 
     -- | Documentation of declarations originating from the module (including
     -- subordinates).
@@ -122,10 +115,9 @@ data Interface = Interface
     -- | All \"visible\" names exported by the module.
     -- A visible name is a name that will show up in the documentation of the
     -- module.
+    --
+    -- Names from modules that are entirely re-exported don't count as visible.
   , ifaceVisibleExports  :: ![Name]
-
-    -- | Aliases of module imports as in @import A.B.C as C@.
-  , ifaceModuleAliases   :: !AliasMap
 
     -- | Instances exported by the module.
   , ifaceInstances       :: ![ClsInst]
@@ -177,7 +169,7 @@ data InstalledInterface = InstalledInterface
     -- module.
   , instVisibleExports   :: [Name]
 
-    -- | Haddock options for this module (prune, ignore-exports, etc).
+    -- | Haddock options for this module (prune, not-home, etc).
   , instOptions          :: [DocOption]
 
   , instFixMap           :: Map Name Fixity
@@ -331,6 +323,9 @@ instance SetName DocName where
     setName name' (Undocumented _) = Undocumented name'
 
 
+instance HasOccName DocName where
+
+    occName = occName . getName
 
 -----------------------------------------------------------------------------
 -- * Instances
@@ -526,10 +521,11 @@ emptyHaddockModInfo = HaddockModInfo
 data DocOption
   = OptHide            -- ^ This module should not appear in the docs.
   | OptPrune
-  | OptIgnoreExports   -- ^ Pretend everything is exported.
   | OptNotHome         -- ^ Not the best place to get docs for things
                        -- exported by this module.
   | OptShowExtensions  -- ^ Render enabled extensions for this module.
+  | OptPrintRuntimeRep -- ^ Render runtime reps for this module (see
+                       -- the GHC @-fprint-explicit-runtime-reps@ flag)
   deriving (Eq, Show)
 
 
@@ -540,23 +536,12 @@ data QualOption
   | OptLocalQual      -- ^ Qualify all imported names fully.
   | OptRelativeQual   -- ^ Like local, but strip module prefix
                       --   from modules in the same hierarchy.
-  | OptAliasedQual    -- ^ Uses aliases of module names
-                      --   as suggested by module import renamings.
-                      --   However, we are unfortunately not able
-                      --   to maintain the original qualifications.
-                      --   Image a re-export of a whole module,
-                      --   how could the re-exported identifiers be qualified?
-
-type AliasMap = Map Module ModuleName
 
 data Qualification
   = NoQual
   | FullQual
   | LocalQual Module
   | RelativeQual Module
-  | AliasedQual AliasMap Module
-       -- ^ @Module@ contains the current module.
-       --   This way we can distinguish imported and local identifiers.
 
 makeContentsQual :: QualOption -> Qualification
 makeContentsQual qual =
@@ -564,12 +549,11 @@ makeContentsQual qual =
     OptNoQual -> NoQual
     _         -> FullQual
 
-makeModuleQual :: QualOption -> AliasMap -> Module -> Qualification
-makeModuleQual qual aliases mdl =
+makeModuleQual :: QualOption -> Module -> Qualification
+makeModuleQual qual mdl =
   case qual of
     OptLocalQual      -> LocalQual mdl
     OptRelativeQual   -> RelativeQual mdl
-    OptAliasedQual    -> AliasedQual aliases mdl
     OptFullQual       -> FullQual
     OptNoQual         -> NoQual
 
@@ -585,6 +569,17 @@ data SinceQual
   = Always
   | External -- ^ only qualify when the thing being annotated is from
              -- an external package
+
+-----------------------------------------------------------------------------
+-- * Renaming
+-----------------------------------------------------------------------------
+
+-- | Validates and renames an identifier.
+--
+-- [@Nothing@]: The input is not a valid identifier.
+--
+-- [@Just []@]: The input is a valid identifier but it's not in scope.
+type Renamer = String -> Maybe [Name]
 
 -----------------------------------------------------------------------------
 -- * Error handling
@@ -664,7 +659,10 @@ instance Monad ErrMsgGhc where
                fmap (second (msgs1 ++)) (runWriterGhc (k a))
 
 instance MonadIO ErrMsgGhc where
-  liftIO m = WriterGhc (fmap (\x -> (x, [])) (liftIO m))
+  liftIO = liftGhcToErrMsgGhc . liftIO
+
+instance HasDynFlags ErrMsgGhc where
+  getDynFlags = liftGhcToErrMsgGhc getDynFlags
 
 -----------------------------------------------------------------------------
 -- * Pass sensitive types

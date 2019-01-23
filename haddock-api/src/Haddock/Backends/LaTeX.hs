@@ -27,7 +27,7 @@ import qualified Pretty
 import BasicTypes           ( PromotionFlag(..) )
 import GHC
 import OccName
-import Name                 ( nameOccName )
+import Name                 ( getOccString, nameOccName, tidyNameOcc )
 import RdrName              ( rdrNameOcc )
 import FastString           ( unpackFS )
 import Outputable           ( panic)
@@ -295,7 +295,7 @@ ppDecl decl pats (doc, fnArgsDoc) instances subdocs _fxts = case unLoc decl of
 --    | Just _  <- tcdTyPats d    -> ppTyInst False loc doc d unicode
 -- Family instances happen via FamInst now
   TyClD _ d@ClassDecl{}          -> ppClassDecl instances doc subdocs d unicode
-  SigD _ (TypeSig _ lnames ty)   -> ppFunSig (doc, fnArgsDoc) (map unLoc lnames) (hsSigWcType ty) unicode
+  SigD _ (TypeSig _ lnames ty)   -> ppFunSig Nothing (doc, fnArgsDoc) (map unLoc lnames) (hsSigWcType ty) unicode
   SigD _ (PatSynSig _ lnames ty) -> ppLPatSig (doc, fnArgsDoc) (map unLoc lnames) ty unicode
   ForD _ d                       -> ppFor (doc, fnArgsDoc) d unicode
   InstD _ _                      -> empty
@@ -307,7 +307,7 @@ ppDecl decl pats (doc, fnArgsDoc) instances subdocs _fxts = case unLoc decl of
 
 ppFor :: DocForDecl DocName -> ForeignDecl DocNameI -> Bool -> LaTeX
 ppFor doc (ForeignImport _ (L _ name) typ _) unicode =
-  ppFunSig doc [name] (hsSigType typ) unicode
+  ppFunSig Nothing doc [name] (hsSigType typ) unicode
 ppFor _ _ _ = error "ppFor error in Haddock.Backends.LaTeX"
 --  error "foreign declarations are currently not supported by --latex"
 
@@ -414,17 +414,23 @@ ppTySyn _ _ _ = error "declaration not supported by ppTySyn"
 -------------------------------------------------------------------------------
 
 
-ppFunSig :: DocForDecl DocName -> [DocName] -> LHsType DocNameI
-         -> Bool -> LaTeX
-ppFunSig doc docnames (L _ typ) unicode =
+ppFunSig
+  :: Maybe LaTeX         -- ^ a prefix to put right before the signature
+  -> DocForDecl DocName  -- ^ documentation
+  -> [DocName]           -- ^ pattern names in the pattern signature
+  -> LHsType DocNameI    -- ^ type of the pattern synonym
+  -> Bool                -- ^ unicode
+  -> LaTeX
+ppFunSig leader doc docnames (L _ typ) unicode =
   ppTypeOrFunSig typ doc
-    ( ppTypeSig names typ False
-    , hsep . punctuate comma $ map ppSymName names
+    ( lead $ ppTypeSig names typ False
+    , lead $ hsep . punctuate comma $ map ppSymName names
     , dcolon unicode
     )
     unicode
  where
    names = map getName docnames
+   lead = maybe id (<+>) leader
 
 -- | Pretty-print a pattern synonym
 ppLPatSig :: DocForDecl DocName  -- ^ documentation
@@ -433,15 +439,7 @@ ppLPatSig :: DocForDecl DocName  -- ^ documentation
           -> Bool                -- ^ unicode
           -> LaTeX
 ppLPatSig doc docnames ty unicode
-  = ppTypeOrFunSig typ doc
-      ( keyword "pattern" <+> ppTypeSig names typ False
-      , keyword "pattern" <+> (hsep . punctuate comma $ map ppSymName names)
-      , dcolon unicode
-      )
-      unicode
-  where
-    typ = unLoc (hsSigType ty)
-    names = map getName docnames
+  = ppFunSig (Just (keyword "pattern")) doc docnames (hsSigType ty) unicode
 
 -- | Pretty-print a type, adding documentation to the whole type and its
 -- arguments as needed.
@@ -587,6 +585,7 @@ ppFds fds unicode =
                            hsep (map (ppDocName . unLoc) vars2)
 
 
+-- TODO: associated types, associated type defaults, docs on default methods
 ppClassDecl :: [DocInstance DocNameI]
             -> Documentation DocName -> [(DocName, DocForDecl DocName)]
             -> TyClDecl DocNameI -> Bool -> LaTeX
@@ -612,13 +611,21 @@ ppClassDecl instances doc subdocs
 
     methodTable =
       text "\\haddockpremethods{}" <> emph (text "Methods") $$
-      vcat  [ ppFunSig doc names (hsSigWcType typ) unicode
-            | L _ (TypeSig _ lnames typ) <- lsigs
+      vcat  [ ppFunSig leader doc names (hsSigType typ) unicode
+            | L _ (ClassOpSig _ is_def lnames typ) <- lsigs
             , let doc = lookupAnySubdoc (head names) subdocs
-                  names = map unLoc lnames ]
-              -- FIXME: is taking just the first name ok? Is it possible that
-              -- there are different subdocs for different names in a single
-              -- type signature?
+                  names = map (cleanName . unLoc) lnames
+                  leader = if is_def then Just (keyword "default") else Nothing
+            ]
+            -- N.B. taking just the first name is ok. Signatures with multiple
+            -- names are expanded so that each name gets its own signature.
+
+    -- Get rid of the ugly '$dm' prefix on default method names
+    cleanName n
+      | isDefaultMethodOcc (occName n)
+      , '$':'d':'m':occStr <- getOccString n
+      = setName (tidyNameOcc (getName n) (mkOccName varName occStr)) n
+      | otherwise = n
 
     instancesBit = ppDocInstances unicode instances
 
@@ -960,7 +967,7 @@ ppContext cxt unicode = ppContextNoLocs (map unLoc cxt) unicode
 
 pp_hs_context :: [HsType DocNameI] -> Bool -> LaTeX
 pp_hs_context []  _       = empty
-pp_hs_context [p] unicode = ppType unicode p
+pp_hs_context [p] unicode = ppCtxType unicode p
 pp_hs_context cxt unicode = parenList (map (ppType unicode) cxt)
 
 
@@ -995,11 +1002,11 @@ ppLType       unicode y = ppType unicode (unLoc y)
 ppLParendType unicode y = ppParendType unicode (unLoc y)
 ppLFunLhType  unicode y = ppFunLhType unicode (unLoc y)
 
-
-ppType, ppParendType, ppFunLhType :: Bool -> HsType DocNameI -> LaTeX
+ppType, ppParendType, ppFunLhType, ppCtxType :: Bool -> HsType DocNameI -> LaTeX
 ppType       unicode ty = ppr_mono_ty (reparenTypePrec PREC_TOP ty) unicode
 ppParendType unicode ty = ppr_mono_ty (reparenTypePrec PREC_TOP ty) unicode
 ppFunLhType  unicode ty = ppr_mono_ty (reparenTypePrec PREC_FUN ty) unicode
+ppCtxType    unicode ty = ppr_mono_ty (reparenTypePrec PREC_CTX ty) unicode
 
 ppLHsTypeArg :: Bool -> LHsTypeArg DocNameI -> LaTeX
 ppLHsTypeArg unicode (HsValArg ty) = ppLParendType unicode ty
@@ -1045,7 +1052,7 @@ ppr_mono_ty (HsTupleTy _ con tys) u = tupleParens con (map (ppLType u) tys)
 ppr_mono_ty (HsSumTy _ tys) u       = sumParens (map (ppLType u) tys)
 ppr_mono_ty (HsKindSig _ ty kind) u = parens (ppr_mono_lty ty u <+> dcolon u <+> ppLKind u kind)
 ppr_mono_ty (HsListTy _ ty)       u = brackets (ppr_mono_lty ty u)
-ppr_mono_ty (HsIParamTy _ (L _ n) ty) u = brackets (ppIPName n <+> dcolon u <+> ppr_mono_lty ty u)
+ppr_mono_ty (HsIParamTy _ (L _ n) ty) u = ppIPName n <+> dcolon u <+> ppr_mono_lty ty u
 ppr_mono_ty (HsSpliceTy {})     _ = error "ppr_mono_ty HsSpliceTy"
 ppr_mono_ty (HsRecTy {})        _ = text "{..}"
 ppr_mono_ty (XHsType (NHsCoreTy {}))  _ = error "ppr_mono_ty HsCoreTy"
@@ -1110,7 +1117,7 @@ ppVerbOccName :: OccName -> LaTeX
 ppVerbOccName = text . latexFilter . occNameString
 
 ppIPName :: HsIPName -> LaTeX
-ppIPName ip = text $ unpackFS $ hsIPNameFS ip
+ppIPName = text . ('?':) . unpackFS . hsIPNameFS
 
 ppOccName :: OccName -> LaTeX
 ppOccName = text . occNameString
@@ -1177,32 +1184,35 @@ latexMonoMunge c   s = latexMunge c s
 
 parLatexMarkup :: (a -> LaTeX) -> DocMarkup a (StringContext -> LaTeX)
 parLatexMarkup ppId = Markup {
-  markupParagraph            = \p v -> p v <> text "\\par" $$ text "",
+  markupParagraph            = \p v -> blockElem $ p v <> text "\\par",
   markupEmpty                = \_ -> empty,
   markupString               = \s v -> text (fixString v s),
   markupAppend               = \l r v -> l v <> r v,
   markupIdentifier           = markupId ppId,
   markupIdentifierUnchecked  = markupId (ppVerbOccName . snd),
   markupModule               = \m _ -> let (mdl,_ref) = break (=='#') m in tt (text mdl),
-  markupWarning              = \p v -> emph (p v),
+  markupWarning              = \p v -> p v,
   markupEmphasis             = \p v -> emph (p v),
   markupBold                 = \p v -> bold (p v),
   markupMonospaced           = \p _ -> tt (p Mono),
-  markupUnorderedList        = \p v -> itemizedList (map ($v) p) $$ text "",
+  markupUnorderedList        = \p v -> blockElem $ itemizedList (map ($v) p),
   markupPic                  = \p _ -> markupPic p,
   markupMathInline           = \p _ -> markupMathInline p,
-  markupMathDisplay          = \p _ -> markupMathDisplay p,
-  markupOrderedList          = \p v -> enumeratedList (map ($v) p) $$ text "",
-  markupDefList              = \l v -> descriptionList (map (\(a,b) -> (a v, b v)) l),
-  markupCodeBlock            = \p _ -> quote (verb (p Verb)) $$ text "",
+  markupMathDisplay          = \p _ -> blockElem $ markupMathDisplay p,
+  markupOrderedList          = \p v -> blockElem $ enumeratedList (map ($v) p),
+  markupDefList              = \l v -> blockElem $ descriptionList (map (\(a,b) -> (a v, b v)) l),
+  markupCodeBlock            = \p _ -> blockElem $ quote (verb (p Verb)),
   markupHyperlink            = \(Hyperlink u l) p -> markupLink u (fmap ($p) l),
   markupAName                = \_ _ -> empty,
-  markupProperty             = \p _ -> quote $ verb $ text p,
-  markupExample              = \e _ -> quote $ verb $ text $ unlines $ map exampleToString e,
+  markupProperty             = \p _ -> blockElem $ quote $ verb $ text p,
+  markupExample              = \e _ -> blockElem $ quote $ verb $ text $ unlines $ map exampleToString e,
   markupHeader               = \(Header l h) p -> header l (h p),
   markupTable                = \(Table h b) p -> table h b p
   }
   where
+    blockElem :: LaTeX -> LaTeX
+    blockElem = ($$ text "")
+
     header 1 d = text "\\section*" <> braces d
     header 2 d = text "\\subsection*" <> braces d
     header l d
