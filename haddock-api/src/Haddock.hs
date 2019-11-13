@@ -372,6 +372,7 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
       _ <- {-# SCC ppHtmlIndex #-}
            ppHtmlIndex odir title pkgStr
                   themes opt_mathjax opt_contents_url sourceUrls' opt_wiki_urls
+                  withQuickjump
                   allVisibleIfaces pretty
       return ()
 
@@ -382,6 +383,7 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
       _ <- {-# SCC ppHtmlContents #-}
            ppHtmlContents dflags' odir title pkgStr
                      themes opt_mathjax opt_index_url sourceUrls' opt_wiki_urls
+                     withQuickjump
                      allVisibleIfaces True prologue pretty
                      sincePkg (makeContentsQual qual)
       return ()
