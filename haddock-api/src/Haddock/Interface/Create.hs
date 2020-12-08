@@ -31,6 +31,7 @@ import Haddock.Interface.LexParseRn
 import Data.Bifunctor
 import Data.Bitraversable
 import qualified Data.Map as M
+import qualified Data.Set as S
 import Data.Map (Map)
 import Data.List
 import Data.Maybe
@@ -91,8 +92,9 @@ createInterface tm unit_state flags modMap instIfaceMap = do
 
       (TcGblEnv { tcg_rdr_env = gre
                 , tcg_warns   = warnings
-                , tcg_exports = all_exports
+                , tcg_exports = all_exports0
                 }, md) = tm_internals_ tm
+      all_local_avails = gresToAvailInfo . filter isLocalGRE . globalRdrEnvElts $ gre
 
   -- The 'pkgName' is necessary to decide what package to mention in "@since"
   -- annotations. Not having it is not fatal though.
@@ -119,9 +121,9 @@ createInterface tm unit_state flags modMap instIfaceMap = do
   let declsWithDocs = topDecls group_
 
       exports0 = fmap (map (first unLoc)) mayExports
-      exports
-        | OptIgnoreExports `elem` opts = Nothing
-        | otherwise = exports0
+      (all_exports, exports)
+        | OptIgnoreExports `elem` opts = (all_local_avails, Nothing)
+        | otherwise = (all_exports0, exports0)
 
       unrestrictedImportedMods
         -- module re-exports are only possible with
@@ -133,8 +135,8 @@ createInterface tm unit_state flags modMap instIfaceMap = do
       fixMap = mkFixMap group_
       (decls, _) = unzip declsWithDocs
       localInsts = filter (nameIsLocalOrFrom sem_mdl)
-                        $  map getName instances
-                        ++ map getName fam_instances
+                        $  map getName fam_instances
+                        ++ map getName instances
       -- Locations of all TH splices
       splices = [ l | L l (SpliceD _ _) <- hsmodDecls hsm ]
 
@@ -170,6 +172,18 @@ createInterface tm unit_state flags modMap instIfaceMap = do
 
   modWarn <- liftErrMsg (moduleWarning dflags gre warnings)
 
+  -- Prune the docstring 'Map's to keep only docstrings that are not private.
+  --
+  -- Besides all the names that GHC has told us this module exports, we also
+  -- keep the docs for locally defined class instances. This is more names than
+  -- we need, but figuring out which instances are fully private is tricky.
+  --
+  -- We do this pruning to avoid having to rename, emit warnings, and save
+  -- docstrings which will anyways never be rendered.
+  let !localVisibleNames = S.fromList (localInsts ++ exportedNames)
+      !prunedDocMap = M.restrictKeys docMap localVisibleNames
+      !prunedArgMap = M.restrictKeys argMap localVisibleNames
+
   return $! Interface {
     ifaceMod               = mdl
   , ifaceIsSig             = is_sig
@@ -178,12 +192,12 @@ createInterface tm unit_state flags modMap instIfaceMap = do
   , ifaceDoc               = Documentation mbDoc modWarn
   , ifaceRnDoc             = Documentation Nothing Nothing
   , ifaceOptions           = opts
-  , ifaceDocMap            = docMap
-  , ifaceArgMap            = argMap
-  , ifaceRnDocMap          = M.empty
-  , ifaceRnArgMap          = M.empty
+  , ifaceDocMap            = prunedDocMap
+  , ifaceArgMap            = prunedArgMap
+  , ifaceRnDocMap          = M.empty -- Filled in `renameInterface`
+  , ifaceRnArgMap          = M.empty -- Filled in `renameInterface`
   , ifaceExportItems       = prunedExportItems
-  , ifaceRnExportItems     = []
+  , ifaceRnExportItems     = [] -- Filled in `renameInterface`
   , ifaceExports           = exportedNames
   , ifaceVisibleExports    = visibleNames
   , ifaceDeclMap           = declMap

@@ -3,6 +3,7 @@
 
 module Documentation.Haddock.ParserSpec (main, spec) where
 
+import           Data.Char (isSpace)
 import           Data.String
 import qualified Documentation.Haddock.Parser as Parse
 import           Documentation.Haddock.Types
@@ -417,6 +418,9 @@ spec = do
       it "accepts anchor reference syntax as DocModule" $ do
         "\"Foo#bar\"" `shouldParseTo` DocModule "Foo#bar"
 
+      it "accepts anchor with hyphen as DocModule" $ do
+        "\"Foo#bar-baz\"" `shouldParseTo` DocModule "Foo\\#bar-baz"
+
       it "accepts old anchor reference syntax as DocModule" $ do
         "\"Foo\\#bar\"" `shouldParseTo` DocModule "Foo\\#bar"
 
@@ -428,6 +432,10 @@ spec = do
     it "is total" $ do
       property $ \xs ->
         (length . show . parseParas) xs `shouldSatisfy` (> 0)
+
+    -- See <https://github.com/haskell/haddock/issues/1142>
+    it "doesn't crash on unicode whitespace" $ do
+      "\8197" `shouldParseTo` DocEmpty
 
     context "when parsing @since" $ do
       it "adds specified version to the result" $ do
@@ -457,7 +465,8 @@ spec = do
 
 
     context "when parsing text paragraphs" $ do
-      let filterSpecial = filter (`notElem` (".(=#-[*`\v\f\n\t\r\\\"'_/@<> " :: String))
+      let isSpecial c = isSpace c || c `elem` (".(=#-[*`\\\"'_/@<>" :: String)
+          filterSpecial = filter (not . isSpecial)
 
       it "parses an empty paragraph" $ do
         "" `shouldParseTo` DocEmpty
