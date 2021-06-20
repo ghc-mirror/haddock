@@ -217,6 +217,7 @@ pre {
 #content {
   margin: 0 auto;
   padding: 0 2em 6em;
+  max-width: 70em;
 }
 
 #package-header {
